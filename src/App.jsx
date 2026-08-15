@@ -2,9 +2,18 @@ import { useState, useEffect, useCallback, Fragment } from "react";
 import {
   Beef, Scale, Users, ClipboardList, Receipt, Plus, Trash2, Download,
   AlertTriangle, Loader2, Check, FileDown, RefreshCw,
-  PackagePlus, PenLine, History, ShieldCheck, UserCog
+  PackagePlus, PenLine, History, ShieldCheck, UserCog,
+  ChevronDown, ChevronRight, CheckCircle2, Circle, MessageSquare
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
+
+// ---------- order fulfillment checklist ----------
+const ORDER_STAGES = [
+  { key: "received", label: "Received" },
+  { key: "entered", label: "Entered" },
+  { key: "fulfilled", label: "Fulfilled" },
+  { key: "invoiced", label: "Invoiced" },
+];
 
 // ---------- constants ----------
 const MARGIN_TIERS = [10, 15, 20, 25, 30];
@@ -79,12 +88,12 @@ function csvEscape(val) {
 }
 function orderCSV(order) {
   const rows = [["Customer", "InvoiceNo", "InvoiceDate", "Item(Product/Service)", "ItemDescription", "ItemQuantity", "ItemRate", "ItemAmount"]];
-  order.lines.forEach((l) => rows.push([order.customerName, order.invoiceNo, order.date, l.itemName, l.itemName, lb(l.qty), l.price.toFixed(2), (l.qty * l.price).toFixed(2)]));
+  order.lines.forEach((l) => rows.push([order.customerName, order.invoiceNo, order.date, l.itemName, l.comment ? `${l.itemName} — ${l.comment}` : l.itemName, lb(l.qty), l.price.toFixed(2), (l.qty * l.price).toFixed(2)]));
   return rows.map((r) => r.map(csvEscape).join(",")).join("\n");
 }
 function ordersToCSV(orders) {
   const rows = [["Customer", "InvoiceNo", "InvoiceDate", "Item(Product/Service)", "ItemDescription", "ItemQuantity", "ItemRate", "ItemAmount"]];
-  orders.forEach((o) => o.lines.forEach((l) => rows.push([o.customerName, o.invoiceNo, o.date, l.itemName, l.itemName, lb(l.qty), l.price.toFixed(2), (l.qty * l.price).toFixed(2)])));
+  orders.forEach((o) => o.lines.forEach((l) => rows.push([o.customerName, o.invoiceNo, o.date, l.itemName, l.comment ? `${l.itemName} — ${l.comment}` : l.itemName, lb(l.qty), l.price.toFixed(2), (l.qty * l.price).toFixed(2)])));
   return rows.map((r) => r.map(csvEscape).join(",")).join("\n");
 }
 
@@ -222,6 +231,15 @@ export default function MeatOrderSystem() {
     if (!ok) { setError("Couldn't mark the invoice as exported — try again."); return; }
     setOrders((prev) => prev.map((o) => (o.id === order.id ? updated : o)));
   };
+  const toggleOrderStage = async (order, stageKey) => {
+    const fresh = await getFresh("orders", order.id);
+    const base = fresh || order;
+    const currentStages = base.stages || { received: false, entered: false, fulfilled: false, invoiced: false };
+    const updated = { ...base, stages: { ...currentStages, [stageKey]: !currentStages[stageKey] } };
+    const ok = await saveRecord("orders", updated);
+    if (!ok) { setError("Couldn't update the order checklist — try again."); return; }
+    setOrders((prev) => prev.map((o) => (o.id === order.id ? updated : o)));
+  };
   const deleteOrder = async (id) => {
     const ok = await deleteRecord("orders", id);
     if (ok == null) { setError("Couldn't delete the order — try again."); return; }
@@ -325,7 +343,7 @@ export default function MeatOrderSystem() {
             {tab === "pricebook" && role === "rep" && <PriceBook items={items} />}
             {tab === "customers" && role === "manager" && <Customers customers={customers} onCreate={createCustomer} onDelete={deleteCustomer} />}
             {tab === "order" && <NewOrder items={items} customers={customers} onSaveOrder={saveOrder} role={role} />}
-            {tab === "orders" && <OrdersView orders={orders} onMarkExported={markExported} onDelete={deleteOrder} role={role} />}
+            {tab === "orders" && <OrdersView orders={orders} onMarkExported={markExported} onToggleStage={toggleOrderStage} onDelete={deleteOrder} role={role} />}
           </>
         )}
       </main>
@@ -723,10 +741,11 @@ function NewOrder({ items, customers, onSaveOrder, role }) {
     const it = items.find((i) => i.id === lf.itemId);
     if (!it || !lf.qty) return;
     const price = lf.useCustom ? Number(lf.custom) || 0 : tierPrice(it.avgCost, lf.tier);
-    setLines([...lines, { id: uid(), itemId: it.id, itemName: it.name, qty: Number(lf.qty), price, cost: it.avgCost, tier: lf.useCustom ? null : lf.tier }]);
+    setLines([...lines, { id: uid(), itemId: it.id, itemName: it.name, qty: Number(lf.qty), price, cost: it.avgCost, tier: lf.useCustom ? null : lf.tier, comment: "" }]);
     setLf({ itemId: "", qty: "", tier: 20, custom: "", useCustom: false });
   };
   const removeLine = (id) => setLines(lines.filter((l) => l.id !== id));
+  const updateLineComment = (id, comment) => setLines(lines.map((l) => (l.id === id ? { ...l, comment } : l)));
 
   const subtotal = lines.reduce((s, l) => s + l.qty * l.price, 0);
   const totalCost = lines.reduce((s, l) => s + l.qty * l.cost, 0);
@@ -738,7 +757,7 @@ function NewOrder({ items, customers, onSaveOrder, role }) {
     if (!cust || lines.length === 0 || saving) return;
     setSaving(true);
     const invoiceNo = `INV-${todayISO().replace(/-/g, "")}-${uid().slice(0, 4).toUpperCase()}`;
-    const order = { id: uid(), invoiceNo, date, customerId: cust.id, customerName: cust.name, lines, subtotal, totalCost, marginDollar, marginPct, exported: false };
+    const order = { id: uid(), invoiceNo, date, customerId: cust.id, customerName: cust.name, lines, subtotal, totalCost, marginDollar, marginPct, exported: false, stages: { received: false, entered: false, fulfilled: false, invoiced: false } };
     const ok = await onSaveOrder(order);
     setSaving(false);
     if (ok) {
@@ -807,15 +826,28 @@ function NewOrder({ items, customers, onSaveOrder, role }) {
                   const lm = lineTotal - l.qty * l.cost;
                   const lmPct = lineTotal > 0 ? (lm / lineTotal) * 100 : 0;
                   return (
-                    <tr key={l.id}>
-                      <td className="py-2 pr-3">{l.itemName}</td>
-                      <td className="text-right py-2 pr-3 mono">{lb(l.qty)}</td>
-                      <td className="text-right py-2 pr-3 mono">{l.tier ? `${l.tier}%` : "custom"}</td>
-                      <td className="text-right py-2 pr-3 mono">{money(l.price)}</td>
-                      <td className="text-right py-2 pr-3 mono">{money(lineTotal)}</td>
-                      {role === "manager" && <td className="text-right py-2 pr-3 mono" style={{ color: lmPct < 0 ? "var(--oxblood)" : "var(--green)", fontWeight: 600 }}>{pct(lmPct)}</td>}
-                      <td className="text-right py-2"><button onClick={() => removeLine(l.id)} style={{ color: "var(--ink-soft)" }}><Trash2 size={14} /></button></td>
-                    </tr>
+                    <Fragment key={l.id}>
+                      <tr>
+                        <td className="py-2 pr-3">{l.itemName}</td>
+                        <td className="text-right py-2 pr-3 mono">{lb(l.qty)}</td>
+                        <td className="text-right py-2 pr-3 mono">{l.tier ? `${l.tier}%` : "custom"}</td>
+                        <td className="text-right py-2 pr-3 mono">{money(l.price)}</td>
+                        <td className="text-right py-2 pr-3 mono">{money(lineTotal)}</td>
+                        {role === "manager" && <td className="text-right py-2 pr-3 mono" style={{ color: lmPct < 0 ? "var(--oxblood)" : "var(--green)", fontWeight: 600 }}>{pct(lmPct)}</td>}
+                        <td className="text-right py-2"><button onClick={() => removeLine(l.id)} style={{ color: "var(--ink-soft)" }}><Trash2 size={14} /></button></td>
+                      </tr>
+                      <tr>
+                        <td colSpan={role === "manager" ? 7 : 6} className="pb-2 pr-3" style={{ borderBottom: "1px solid var(--line)" }}>
+                          <input
+                            value={l.comment || ""}
+                            onChange={(e) => updateLineComment(l.id, e.target.value)}
+                            placeholder="Comment for this item (e.g. cut into 1lb portions, bone-in)…"
+                            className="px-2 py-1 w-full text-xs"
+                            style={{ background: "#fff" }}
+                          />
+                        </td>
+                      </tr>
+                    </Fragment>
                   );
                 })}
               </tbody>
@@ -839,8 +871,10 @@ function NewOrder({ items, customers, onSaveOrder, role }) {
 }
 
 // ---------- Orders & Invoices ----------
-function OrdersView({ orders, onMarkExported, onDelete, role }) {
+function OrdersView({ orders, onMarkExported, onToggleStage, onDelete, role }) {
+  const [expanded, setExpanded] = useState({});
   const unexported = orders.filter((o) => !o.exported);
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -860,26 +894,83 @@ function OrdersView({ orders, onMarkExported, onDelete, role }) {
             <thead>
               <tr>
                 <th className="text-left py-2 px-3">Invoice</th><th className="text-left py-2 px-3">Date</th><th className="text-left py-2 px-3">Customer</th>
-                <th className="text-right py-2 px-3">Total</th>{role === "manager" && <th className="text-right py-2 px-3">Margin</th>}<th className="text-left py-2 px-3">Status</th><th></th>
+                <th className="text-right py-2 px-3">Total</th>{role === "manager" && <th className="text-right py-2 px-3">Margin</th>}
+                <th className="text-left py-2 px-3">Checklist</th><th></th>
               </tr>
             </thead>
             <tbody>
-              {orders.map((o) => (
-                <tr key={o.id}>
-                  <td className="py-2 px-3 mono">{o.invoiceNo}</td>
-                  <td className="py-2 px-3 mono">{o.date}</td>
-                  <td className="py-2 px-3">{o.customerName}</td>
-                  <td className="text-right py-2 px-3 mono">{money(o.subtotal)}</td>
-                  {role === "manager" && <td className="text-right py-2 px-3 mono" style={{ color: o.marginDollar < 0 ? "var(--oxblood)" : "var(--green)" }}>{money(o.marginDollar)} ({pct(o.marginPct)})</td>}
-                  <td className="py-2 px-3"><span className="stamp" style={{ color: o.exported ? "var(--green)" : "var(--brass)" }}>{o.exported ? "exported" : "pending"}</span></td>
-                  <td className="py-2 px-3">
-                    <div className="flex items-center justify-end gap-2">
-                      <button onClick={() => { downloadText(`${o.invoiceNo}.csv`, orderCSV(o)); onMarkExported(o); }} title="Download invoice CSV" style={{ color: "var(--ink)" }}><Download size={15} /></button>
-                      {role === "manager" && <button onClick={() => onDelete(o.id)} title="Delete order" style={{ color: "var(--oxblood)" }}><Trash2 size={14} /></button>}
-                    </div>
-                  </td>
-                </tr>
-              ))}
+              {orders.map((o) => {
+                const stages = o.stages || { received: false, entered: false, fulfilled: false, invoiced: false };
+                const complete = ORDER_STAGES.every((s) => stages[s.key]);
+                const isOpen = expanded[o.id];
+                return (
+                  <Fragment key={o.id}>
+                    <tr>
+                      <td className="py-2 px-3">
+                        <button onClick={() => setExpanded((e) => ({ ...e, [o.id]: !isOpen }))} className="flex items-center gap-1 mono">
+                          {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />} {o.invoiceNo}
+                        </button>
+                      </td>
+                      <td className="py-2 px-3 mono">{o.date}</td>
+                      <td className="py-2 px-3">{o.customerName}</td>
+                      <td className="text-right py-2 px-3 mono">{money(o.subtotal)}</td>
+                      {role === "manager" && <td className="text-right py-2 px-3 mono" style={{ color: o.marginDollar < 0 ? "var(--oxblood)" : "var(--green)" }}>{money(o.marginDollar)} ({pct(o.marginPct)})</td>}
+                      <td className="py-2 px-3">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          {complete && <CheckCircle2 size={16} color="var(--green)" title="Order chain complete" />}
+                          {ORDER_STAGES.map((s) => (
+                            <button
+                              key={s.key}
+                              onClick={() => onToggleStage(o, s.key)}
+                              title={s.label}
+                              className="stamp flex items-center gap-1"
+                              style={{ color: stages[s.key] ? "var(--green)" : "var(--ink-soft)", borderColor: stages[s.key] ? "var(--green)" : "var(--line)", cursor: "pointer" }}
+                            >
+                              {stages[s.key] ? <CheckCircle2 size={11} /> : <Circle size={11} />} {s.label}
+                            </button>
+                          ))}
+                        </div>
+                      </td>
+                      <td className="py-2 px-3">
+                        <div className="flex items-center justify-end gap-2">
+                          <button onClick={() => { downloadText(`${o.invoiceNo}.csv`, orderCSV(o)); onMarkExported(o); }} title="Download invoice CSV" style={{ color: "var(--ink)" }}><Download size={15} /></button>
+                          {role === "manager" && <button onClick={() => onDelete(o.id)} title="Delete order" style={{ color: "var(--oxblood)" }}><Trash2 size={14} /></button>}
+                        </div>
+                      </td>
+                    </tr>
+                    {isOpen && (
+                      <tr>
+                        <td colSpan={role === "manager" ? 7 : 6} className="p-3" style={{ background: "#fff" }}>
+                          <table className="w-full text-xs">
+                            <thead>
+                              <tr>
+                                <th className="text-left py-1 pr-3">Item</th>
+                                <th className="text-right py-1 pr-3">Qty lb</th>
+                                <th className="text-right py-1 pr-3">Price/lb</th>
+                                <th className="text-right py-1 pr-3">Line total</th>
+                                <th className="text-left py-1">Comment</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {o.lines.map((l) => (
+                                <tr key={l.id}>
+                                  <td className="py-1 pr-3">{l.itemName}</td>
+                                  <td className="text-right py-1 pr-3 mono">{lb(l.qty)}</td>
+                                  <td className="text-right py-1 pr-3 mono">{money(l.price)}</td>
+                                  <td className="text-right py-1 pr-3 mono">{money(l.qty * l.price)}</td>
+                                  <td className="py-1" style={{ color: l.comment ? "var(--ink)" : "var(--ink-soft)" }}>
+                                    {l.comment ? <span className="flex items-center gap-1"><MessageSquare size={11} />{l.comment}</span> : "—"}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
+                );
+              })}
             </tbody>
           </table>
         </div>
