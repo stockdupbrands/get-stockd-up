@@ -3,7 +3,7 @@ import {
   Beef, Scale, Users, ClipboardList, Receipt, Plus, Trash2, Download,
   AlertTriangle, Loader2, Check, FileDown, RefreshCw,
   PackagePlus, PenLine, History, ShieldCheck, UserCog,
-  ChevronDown, ChevronRight, CheckCircle2, Circle, MessageSquare
+  ChevronDown, ChevronRight, CheckCircle2, Circle, MessageSquare, BarChart3
 } from "lucide-react";
 import { supabase } from "./supabaseClient";
 
@@ -25,6 +25,17 @@ const money = (n) => { const v = Number(n); return isFinite(v) ? v.toLocaleStrin
 const pct = (n) => { const v = Number(n); return isFinite(v) ? v.toFixed(1) + "%" : "0.0%"; };
 const lb = (n) => { const v = Number(n); return isFinite(v) ? v.toFixed(2) : "0.00"; };
 const todayISO = () => new Date().toISOString().slice(0, 10);
+// Sunday-start calendar week the given date falls in, as an ISO date string
+const weekStartOf = (dateStr) => {
+  const d = new Date(dateStr + "T00:00:00");
+  if (isNaN(d)) return dateStr;
+  d.setDate(d.getDate() - d.getDay());
+  return d.toISOString().slice(0, 10);
+};
+const weekLabel = (isoDate) => {
+  const d = new Date(isoDate + "T00:00:00");
+  return `Week of ${d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}`;
+};
 const tierPrice = (cost, tierPct) => { const c = Number(cost) || 0; return tierPct >= 100 ? 0 : c / (1 - tierPct / 100); };
 const weightedAvg = (onHandQty, avgCost, recvQty, recvCost) => {
   const oh = Number(onHandQty) || 0, ac = Number(avgCost) || 0, rq = Number(recvQty) || 0, rc = Number(recvCost) || 0;
@@ -252,6 +263,7 @@ export default function MeatOrderSystem() {
     { id: "customers", label: "Customers", icon: Users },
     { id: "order", label: "New Order", icon: ClipboardList },
     { id: "orders", label: "Orders & Invoices", icon: Receipt },
+    { id: "reports", label: "Reports", icon: BarChart3 },
   ];
   const repTabs = [
     { id: "pricebook", label: "Price Book", icon: Scale },
@@ -344,6 +356,7 @@ export default function MeatOrderSystem() {
             {tab === "customers" && role === "manager" && <Customers customers={customers} onCreate={createCustomer} onDelete={deleteCustomer} />}
             {tab === "order" && <NewOrder items={items} customers={customers} onSaveOrder={saveOrder} role={role} />}
             {tab === "orders" && <OrdersView orders={orders} onMarkExported={markExported} onToggleStage={toggleOrderStage} onDelete={deleteOrder} role={role} />}
+            {tab === "reports" && role === "manager" && <ReportsView orders={orders} />}
           </>
         )}
       </main>
@@ -729,6 +742,9 @@ function Customers({ customers, onCreate, onDelete }) {
 function NewOrder({ items, customers, onSaveOrder, role }) {
   const [customerId, setCustomerId] = useState("");
   const [date, setDate] = useState(todayISO());
+  const [repName, setRepName] = useState(() => {
+    try { return localStorage.getItem("last-rep-name") || ""; } catch (e) { return ""; }
+  });
   const [lines, setLines] = useState([]);
   const [lf, setLf] = useState({ itemId: "", qty: "", tier: 20, custom: "", useCustom: false });
   const [savedMsg, setSavedMsg] = useState("");
@@ -757,12 +773,13 @@ function NewOrder({ items, customers, onSaveOrder, role }) {
     if (!cust || lines.length === 0 || saving) return;
     setSaving(true);
     const invoiceNo = `INV-${todayISO().replace(/-/g, "")}-${uid().slice(0, 4).toUpperCase()}`;
-    const order = { id: uid(), invoiceNo, date, customerId: cust.id, customerName: cust.name, lines, subtotal, totalCost, marginDollar, marginPct, exported: false, stages: { received: false, entered: false, fulfilled: false, invoiced: false } };
+    const order = { id: uid(), invoiceNo, date, customerId: cust.id, customerName: cust.name, repName: repName.trim(), lines, subtotal, totalCost, marginDollar, marginPct, exported: false, stages: { received: false, entered: false, fulfilled: false, invoiced: false } };
     const ok = await onSaveOrder(order);
     setSaving(false);
     if (ok) {
       setSavedMsg(`Saved as ${invoiceNo}.`);
       setLines([]); setCustomerId("");
+      try { localStorage.setItem("last-rep-name", repName.trim()); } catch (e) {}
       setTimeout(() => setSavedMsg(""), 5000);
     }
   };
@@ -777,6 +794,7 @@ function NewOrder({ items, customers, onSaveOrder, role }) {
           </select>
           <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="px-3 py-2 mono" />
         </div>
+        <input value={repName} onChange={(e) => setRepName(e.target.value)} placeholder="Placed by (your name)" className="px-3 py-2 w-full mt-3" />
         {customers.length === 0 && <p className="text-sm mt-2" style={{ color: "var(--oxblood)" }}>No customers yet — a manager can add one in the Customers tab.</p>}
       </section>
 
@@ -893,7 +911,7 @@ function OrdersView({ orders, onMarkExported, onToggleStage, onDelete, role }) {
           <table className="w-full text-sm" style={{ background: "var(--paper-card)", border: "1.5px solid var(--ink)" }}>
             <thead>
               <tr>
-                <th className="text-left py-2 px-3">Invoice</th><th className="text-left py-2 px-3">Date</th><th className="text-left py-2 px-3">Customer</th>
+                <th className="text-left py-2 px-3">Invoice</th><th className="text-left py-2 px-3">Date</th><th className="text-left py-2 px-3">Customer</th><th className="text-left py-2 px-3">Rep</th>
                 <th className="text-right py-2 px-3">Total</th>{role === "manager" && <th className="text-right py-2 px-3">Margin</th>}
                 <th className="text-left py-2 px-3">Checklist</th><th></th>
               </tr>
@@ -913,6 +931,7 @@ function OrdersView({ orders, onMarkExported, onToggleStage, onDelete, role }) {
                       </td>
                       <td className="py-2 px-3 mono">{o.date}</td>
                       <td className="py-2 px-3">{o.customerName}</td>
+                      <td className="py-2 px-3">{o.repName || "—"}</td>
                       <td className="text-right py-2 px-3 mono">{money(o.subtotal)}</td>
                       {role === "manager" && <td className="text-right py-2 px-3 mono" style={{ color: o.marginDollar < 0 ? "var(--oxblood)" : "var(--green)" }}>{money(o.marginDollar)} ({pct(o.marginPct)})</td>}
                       <td className="py-2 px-3">
@@ -940,7 +959,7 @@ function OrdersView({ orders, onMarkExported, onToggleStage, onDelete, role }) {
                     </tr>
                     {isOpen && (
                       <tr>
-                        <td colSpan={role === "manager" ? 7 : 6} className="p-3" style={{ background: "#fff" }}>
+                        <td colSpan={role === "manager" ? 8 : 7} className="p-3" style={{ background: "#fff" }}>
                           <table className="w-full text-xs">
                             <thead>
                               <tr>
@@ -975,6 +994,79 @@ function OrdersView({ orders, onMarkExported, onToggleStage, onDelete, role }) {
           </table>
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------- Reports (manager) ----------
+function ReportsView({ orders }) {
+  const byWeek = {};
+  const byRep = {};
+  orders.forEach((o) => {
+    const wk = weekStartOf(o.date);
+    if (!byWeek[wk]) byWeek[wk] = { orders: 0, subtotal: 0, cost: 0, margin: 0 };
+    byWeek[wk].orders += 1;
+    byWeek[wk].subtotal += Number(o.subtotal) || 0;
+    byWeek[wk].cost += Number(o.totalCost) || 0;
+    byWeek[wk].margin += Number(o.marginDollar) || 0;
+
+    const rep = o.repName?.trim() || "Unassigned";
+    if (!byRep[rep]) byRep[rep] = { orders: 0, subtotal: 0, cost: 0, margin: 0 };
+    byRep[rep].orders += 1;
+    byRep[rep].subtotal += Number(o.subtotal) || 0;
+    byRep[rep].cost += Number(o.totalCost) || 0;
+    byRep[rep].margin += Number(o.marginDollar) || 0;
+  });
+
+  const weekRows = Object.entries(byWeek).sort((a, b) => (a[0] < b[0] ? 1 : -1));
+  const repRows = Object.entries(byRep).sort((a, b) => b[1].subtotal - a[1].subtotal);
+
+  const Table = ({ title, rows, labelFn, keyHeader }) => (
+    <section style={{ background: "var(--paper-card)", border: "1.5px solid var(--ink)" }} className="rounded p-4 sm:p-5">
+      <h2 className="disp mb-3" style={{ fontWeight: 700, fontSize: "1.05rem" }}>{title}</h2>
+      {rows.length === 0 ? (
+        <p className="text-sm" style={{ color: "var(--ink-soft)" }}>No orders yet.</p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr>
+                <th className="text-left py-2 pr-3">{keyHeader}</th>
+                <th className="text-right py-2 pr-3">Orders</th>
+                <th className="text-right py-2 pr-3">Total Sales</th>
+                <th className="text-right py-2 pr-3">Total Cost</th>
+                <th className="text-right py-2 pr-3">Margin $</th>
+                <th className="text-right py-2 pr-3">Margin %</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map(([key, v]) => {
+                const marginPct = v.subtotal > 0 ? (v.margin / v.subtotal) * 100 : 0;
+                return (
+                  <tr key={key}>
+                    <td className="py-2 pr-3">{labelFn(key)}</td>
+                    <td className="text-right py-2 pr-3 mono">{v.orders}</td>
+                    <td className="text-right py-2 pr-3 mono">{money(v.subtotal)}</td>
+                    <td className="text-right py-2 pr-3 mono">{money(v.cost)}</td>
+                    <td className="text-right py-2 pr-3 mono" style={{ color: v.margin < 0 ? "var(--oxblood)" : "var(--green)", fontWeight: 600 }}>{money(v.margin)}</td>
+                    <td className="text-right py-2 pr-3 mono" style={{ color: v.margin < 0 ? "var(--oxblood)" : "var(--green)" }}>{pct(marginPct)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+
+  return (
+    <div className="flex flex-col gap-6">
+      <p className="text-sm" style={{ color: "var(--ink-soft)" }}>
+        Weeks run Sunday–Saturday, based on each order's date. Rep totals come from the "Placed by" field on each order — orders with nothing entered there show as "Unassigned."
+      </p>
+      <Table title="Totals by Week" rows={weekRows} labelFn={weekLabel} keyHeader="Week" />
+      <Table title="Totals by Sales Rep" rows={repRows} labelFn={(k) => k} keyHeader="Sales Rep" />
     </div>
   );
 }
