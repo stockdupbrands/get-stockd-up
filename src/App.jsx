@@ -251,6 +251,36 @@ export default function MeatOrderSystem() {
     if (!ok) { setError("Couldn't update the order checklist — try again."); return; }
     setOrders((prev) => prev.map((o) => (o.id === order.id ? updated : o)));
   };
+  const updateLineWeight = async (order, lineId, actualQty) => {
+    const fresh = await getFresh("orders", order.id);
+    const base = fresh || order;
+    const line = base.lines.find((l) => l.id === lineId);
+    if (!line) { setError("Couldn't find that line item — try refreshing."); return; }
+    const delta = actualQty - (Number(line.qty) || 0);
+    const newLines = base.lines.map((l) => (l.id === lineId ? { ...l, qty: actualQty, weightUpdated: true } : l));
+    const subtotal = newLines.reduce((s, l) => s + l.qty * l.price, 0);
+    const totalCost = newLines.reduce((s, l) => s + l.qty * l.cost, 0);
+    const marginDollar = subtotal - totalCost;
+    const marginPct = subtotal > 0 ? (marginDollar / subtotal) * 100 : 0;
+    const updatedOrder = { ...base, lines: newLines, subtotal, totalCost, marginDollar, marginPct };
+    const ok = await saveRecord("orders", updatedOrder);
+    if (!ok) { setError("Couldn't save the catch weight — try again."); return; }
+    setOrders((prev) => prev.map((o) => (o.id === order.id ? updatedOrder : o)));
+
+    if (line.itemId && delta !== 0) {
+      const freshItem = await getFresh("items", line.itemId);
+      if (freshItem) {
+        const updatedItem = {
+          ...freshItem,
+          onHandQty: (Number(freshItem.onHandQty) || 0) - delta,
+          history: [{ id: uid(), date: todayISO(), type: "sale", qty: -delta, cost: freshItem.avgCost, note: `Catch weight adjustment on ${order.invoiceNo}` }, ...(freshItem.history || [])],
+        };
+        const itemOk = await saveRecord("items", updatedItem);
+        if (itemOk) setItems((prev) => prev.map((i) => (i.id === line.itemId ? updatedItem : i)));
+        else setError("Order updated, but inventory adjustment for the catch weight didn't save — check Inventory manually.");
+      }
+    }
+  };
   const deleteOrder = async (id) => {
     const ok = await deleteRecord("orders", id);
     if (ok == null) { setError("Couldn't delete the order — try again."); return; }
@@ -355,7 +385,7 @@ export default function MeatOrderSystem() {
             {tab === "pricebook" && role === "rep" && <PriceBook items={items} />}
             {tab === "customers" && role === "manager" && <Customers customers={customers} onCreate={createCustomer} onDelete={deleteCustomer} />}
             {tab === "order" && <NewOrder items={items} customers={customers} onSaveOrder={saveOrder} role={role} />}
-            {tab === "orders" && <OrdersView orders={orders} onMarkExported={markExported} onToggleStage={toggleOrderStage} onDelete={deleteOrder} role={role} />}
+            {tab === "orders" && <OrdersView orders={orders} onMarkExported={markExported} onToggleStage={toggleOrderStage} onUpdateWeight={updateLineWeight} onDelete={deleteOrder} role={role} />}
             {tab === "reports" && role === "manager" && <ReportsView orders={orders} />}
           </>
         )}
@@ -807,6 +837,7 @@ function NewOrder({ items, customers, onSaveOrder, role }) {
           </select>
           <input placeholder="Qty lb" type="number" value={lf.qty} onChange={(e) => setLf({ ...lf, qty: e.target.value })} className="px-3 py-2 w-full sm:w-24 mono" />
         </div>
+        <p className="text-xs mt-2" style={{ color: "var(--ink-soft)" }}>Once the order is saved, you can update any line's actual weight later from Orders & Invoices.</p>
         <div className="flex flex-wrap items-center gap-2 mt-3">
           {MARGIN_TIERS.map((t) => (
             <button key={t} onClick={() => setLf({ ...lf, tier: t, useCustom: false })}
@@ -889,8 +920,10 @@ function NewOrder({ items, customers, onSaveOrder, role }) {
 }
 
 // ---------- Orders & Invoices ----------
-function OrdersView({ orders, onMarkExported, onToggleStage, onDelete, role }) {
+function OrdersView({ orders, onMarkExported, onToggleStage, onUpdateWeight, onDelete, role }) {
   const [expanded, setExpanded] = useState({});
+  const [weightEdit, setWeightEdit] = useState(null); // { orderId, lineId }
+  const [weightValue, setWeightValue] = useState("");
   const unexported = orders.filter((o) => !o.exported);
 
   return (
@@ -967,21 +1000,55 @@ function OrdersView({ orders, onMarkExported, onToggleStage, onDelete, role }) {
                                 <th className="text-right py-1 pr-3">Qty lb</th>
                                 <th className="text-right py-1 pr-3">Price/lb</th>
                                 <th className="text-right py-1 pr-3">Line total</th>
+                                <th className="text-left py-1 pr-3">Weight</th>
                                 <th className="text-left py-1">Comment</th>
                               </tr>
                             </thead>
                             <tbody>
-                              {o.lines.map((l) => (
-                                <tr key={l.id}>
-                                  <td className="py-1 pr-3">{l.itemName}</td>
-                                  <td className="text-right py-1 pr-3 mono">{lb(l.qty)}</td>
-                                  <td className="text-right py-1 pr-3 mono">{money(l.price)}</td>
-                                  <td className="text-right py-1 pr-3 mono">{money(l.qty * l.price)}</td>
-                                  <td className="py-1" style={{ color: l.comment ? "var(--ink)" : "var(--ink-soft)" }}>
-                                    {l.comment ? <span className="flex items-center gap-1"><MessageSquare size={11} />{l.comment}</span> : "—"}
-                                  </td>
-                                </tr>
-                              ))}
+                              {o.lines.map((l) => {
+                                const editingThis = weightEdit?.orderId === o.id && weightEdit?.lineId === l.id;
+                                return (
+                                  <Fragment key={l.id}>
+                                    <tr>
+                                      <td className="py-1 pr-3">{l.itemName}</td>
+                                      <td className="text-right py-1 pr-3 mono">{lb(l.qty)}</td>
+                                      <td className="text-right py-1 pr-3 mono">{money(l.price)}</td>
+                                      <td className="text-right py-1 pr-3 mono">{money(l.qty * l.price)}</td>
+                                      <td className="py-1 pr-3">
+                                        <button onClick={() => { setWeightEdit({ orderId: o.id, lineId: l.id }); setWeightValue(String(l.qty)); }} className="stamp" style={{ color: l.weightUpdated ? "var(--green)" : "var(--brass)", cursor: "pointer" }}>
+                                          {l.weightUpdated ? "updated" : "update weight"}
+                                        </button>
+                                      </td>
+                                      <td className="py-1" style={{ color: l.comment ? "var(--ink)" : "var(--ink-soft)" }}>
+                                        {l.comment ? <span className="flex items-center gap-1"><MessageSquare size={11} />{l.comment}</span> : "—"}
+                                      </td>
+                                    </tr>
+                                    {editingThis && (
+                                      <tr>
+                                        <td colSpan={6} className="pb-2" style={{ background: "#F4E4D8" }}>
+                                          <div className="flex flex-wrap items-center gap-2 p-2">
+                                            <span>Actual weight for {l.itemName}:</span>
+                                            <input type="number" value={weightValue} onChange={(e) => setWeightValue(e.target.value)} className="px-2 py-1 w-24 mono" autoFocus />
+                                            <span style={{ color: "var(--ink-soft)" }}>lb</span>
+                                            <button
+                                              onClick={async () => {
+                                                const v = Number(weightValue);
+                                                if (!v) return;
+                                                await onUpdateWeight(o, l.id, v);
+                                                setWeightEdit(null);
+                                              }}
+                                              className="tag-btn tag-btn-primary px-3 py-1 rounded flex items-center gap-1"
+                                            >
+                                              <Check size={13} /> Confirm
+                                            </button>
+                                            <button onClick={() => setWeightEdit(null)} style={{ color: "var(--ink-soft)" }}>Cancel</button>
+                                          </div>
+                                        </td>
+                                      </tr>
+                                    )}
+                                  </Fragment>
+                                );
+                              })}
                             </tbody>
                           </table>
                         </td>
@@ -1002,6 +1069,7 @@ function OrdersView({ orders, onMarkExported, onToggleStage, onDelete, role }) {
 function ReportsView({ orders }) {
   const byWeek = {};
   const byRep = {};
+  const byRepWeek = {};
   orders.forEach((o) => {
     const wk = weekStartOf(o.date);
     if (!byWeek[wk]) byWeek[wk] = { orders: 0, subtotal: 0, cost: 0, margin: 0 };
@@ -1016,10 +1084,21 @@ function ReportsView({ orders }) {
     byRep[rep].subtotal += Number(o.subtotal) || 0;
     byRep[rep].cost += Number(o.totalCost) || 0;
     byRep[rep].margin += Number(o.marginDollar) || 0;
+
+    const rwKey = `${rep}||${wk}`;
+    if (!byRepWeek[rwKey]) byRepWeek[rwKey] = { rep, wk, orders: 0, subtotal: 0, cost: 0, margin: 0 };
+    byRepWeek[rwKey].orders += 1;
+    byRepWeek[rwKey].subtotal += Number(o.subtotal) || 0;
+    byRepWeek[rwKey].cost += Number(o.totalCost) || 0;
+    byRepWeek[rwKey].margin += Number(o.marginDollar) || 0;
   });
 
   const weekRows = Object.entries(byWeek).sort((a, b) => (a[0] < b[0] ? 1 : -1));
   const repRows = Object.entries(byRep).sort((a, b) => b[1].subtotal - a[1].subtotal);
+  const repWeekRows = Object.values(byRepWeek).sort((a, b) => {
+    if (a.rep !== b.rep) return a.rep.localeCompare(b.rep);
+    return a.wk < b.wk ? 1 : -1;
+  });
 
   const Table = ({ title, rows, labelFn, keyHeader }) => (
     <section style={{ background: "var(--paper-card)", border: "1.5px solid var(--ink)" }} className="rounded p-4 sm:p-5">
@@ -1067,6 +1146,45 @@ function ReportsView({ orders }) {
       </p>
       <Table title="Totals by Week" rows={weekRows} labelFn={weekLabel} keyHeader="Week" />
       <Table title="Totals by Sales Rep" rows={repRows} labelFn={(k) => k} keyHeader="Sales Rep" />
+
+      <section style={{ background: "var(--paper-card)", border: "1.5px solid var(--ink)" }} className="rounded p-4 sm:p-5">
+        <h2 className="disp mb-3" style={{ fontWeight: 700, fontSize: "1.05rem" }}>Weekly Margin by Sales Rep</h2>
+        {repWeekRows.length === 0 ? (
+          <p className="text-sm" style={{ color: "var(--ink-soft)" }}>No orders yet.</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr>
+                  <th className="text-left py-2 pr-3">Sales Rep</th>
+                  <th className="text-left py-2 pr-3">Week</th>
+                  <th className="text-right py-2 pr-3">Orders</th>
+                  <th className="text-right py-2 pr-3">Total Sales</th>
+                  <th className="text-right py-2 pr-3">Total Cost</th>
+                  <th className="text-right py-2 pr-3">Margin $</th>
+                  <th className="text-right py-2 pr-3">Margin %</th>
+                </tr>
+              </thead>
+              <tbody>
+                {repWeekRows.map((v) => {
+                  const marginPct = v.subtotal > 0 ? (v.margin / v.subtotal) * 100 : 0;
+                  return (
+                    <tr key={`${v.rep}||${v.wk}`}>
+                      <td className="py-2 pr-3">{v.rep}</td>
+                      <td className="py-2 pr-3">{weekLabel(v.wk)}</td>
+                      <td className="text-right py-2 pr-3 mono">{v.orders}</td>
+                      <td className="text-right py-2 pr-3 mono">{money(v.subtotal)}</td>
+                      <td className="text-right py-2 pr-3 mono">{money(v.cost)}</td>
+                      <td className="text-right py-2 pr-3 mono" style={{ color: v.margin < 0 ? "var(--oxblood)" : "var(--green)", fontWeight: 600 }}>{money(v.margin)}</td>
+                      <td className="text-right py-2 pr-3 mono" style={{ color: v.margin < 0 ? "var(--oxblood)" : "var(--green)" }}>{pct(marginPct)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
     </div>
   );
 }
